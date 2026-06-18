@@ -1,0 +1,22 @@
+# Compiled Windows binaries
+*.exe
+*.o
+*.obj
+*.pdb
+*.ilk
+
+# CMake and build directories
+build/
+out/
+.cmake/
+CMakeCache.txt
+CMakeFiles/
+
+# IDE configurations
+.vscode/
+.vs/
+*.sln
+*.vcxproj
+
+# Local database volumes 
+pgdata/

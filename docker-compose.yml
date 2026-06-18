@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  # 1. Central PostgreSQL Database
+  postgres_db:
+    image: postgres:15-alpine
+    container_name: local_postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: my_secure_password
+      POSTGRES_DB: metadata
+    ports:
+      - "5432:5432" # Exposes Postgres to your local C++ code on port 5432
+    volumes:
+      - pgdata:/var/lib/postgresql/data # Makes sure your data isn't deleted when Docker stops
+
+  # 2. NGINX Load Balancer
+  nginx_lb:
+    image: nginx:alpine
+    container_name: local_nginx
+    ports:
+      - "80:80" # Exposes NGINX to your browser on port 80
+    volumes:
+      - ./nginx/master_nginx.conf:/etc/nginx/nginx.conf:ro # Mounts your config file as Read-Only
+    extra_hosts:
+      - "host.docker.internal:host-gateway" # CRUCIAL: Allows NGINX to talk to your laptop's localhost!
+    depends_on:
+      - postgres_db # Ensures database starts before the load balancer
+
+volumes:
+  pgdata:
