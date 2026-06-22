@@ -1,27 +1,27 @@
 #include "MasterServer.hpp"
+#include "PostgresRepository.hpp"
 #include <iostream>
 #include <string>
+#include <cstdlib>
 
 int main(int argc, char *argv[])
 {
-  // 1. Set the default port to 8081
   int port = 8081;
 
-  // 2. If a port is passed in the terminal, use that instead
   if (argc > 1)
   {
     port = std::stoi(argv[1]);
   }
 
-  // 3. Initialize the server class
-  MasterServer server(port);
+  const char *db_host = std::getenv("DB_HOST") ? std::getenv("DB_HOST") : "127.0.0.1";
 
-  // 4. Print to the terminal so we know it's running
+  std::string conn_str = "user=postgres password=password host=" + std::string(db_host) + " port=5432 dbname=metadata";
+  PostgresRepository repo(conn_str);
+  MasterServer server(port, &repo);
+
   std::cout << "[INIT] Master Node booting up on port " << port << "...\n";
-  std::cout << "[INIT] Waiting for NGINX to route traffic...\n";
+  std::cout << "[INIT] Connecting to PostgreSQL on " << db_host << ":5432...\n";
 
-  // 5. Start listening (This will block the program from exiting)
   server.Listen(port);
-
   return 0;
 }
