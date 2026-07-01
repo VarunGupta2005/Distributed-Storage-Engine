@@ -1,7 +1,7 @@
--- 1.Trigram extension
+-- 1. Trigram extension for fast case-insensitive partial string matches
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
--- 2. Worker Nodes
+-- 2. Worker Nodes (Handles the Dual-Identity for Split-Horizon Routing)
 CREATE TABLE IF NOT EXISTS worker_nodes (
     worker_id SERIAL PRIMARY KEY,
     
@@ -44,9 +44,16 @@ CREATE TABLE IF NOT EXISTS files (
 CREATE TABLE IF NOT EXISTS chunks (
     chunk_hash VARCHAR(64) PRIMARY KEY, -- SHA-256 signature
     nodes TEXT[] NOT NULL,              -- Array of internal worker coordinates: {"worker_1:9001", "worker_2:9001"}
-    ref_count INT DEFAULT 0             -- Starts at 0 for Two-Phase Commit
+    ref_count INT DEFAULT 0,            -- Starts at 0 for Two-Phase Commit
+    
+    -- Added: Tracks exactly when the chunk was first registered or had its lease renewed [1]
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP 
 );
 
 -- 6. Performance & Search Optimization Indexes
-CREATE INDEX idx_files_user_public ON files(user_id, is_public);
+CREATE INDEX IF NOT EXISTS idx_files_user_public ON files(user_id, is_public);
 CREATE INDEX idx_files_filename_trgm ON files USING gin (filename gin_trgm_ops); 
+
+-- Added: Partial Index for high-performance Garbage Collection.
+-- This ONLY indexes orphaned/pending chunks (ref_count = 0) 
+CREATE INDEX IF NOT EXISTS idx_chunks_orphans_gc ON chunks(created_at) WHERE ref_count = 0;

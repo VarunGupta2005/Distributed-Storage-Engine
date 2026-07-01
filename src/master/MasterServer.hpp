@@ -27,4 +27,9 @@ public:
   {
     svr.listen("0.0.0.0", port);
   }
+
+  void Stop()
+  {
+    svr.stop(); // Stops the cpp-httplib listening loop safely
+  }
 };
