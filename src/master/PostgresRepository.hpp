@@ -187,7 +187,7 @@ public:
   bool DeleteChunkRecordsBulk(const std::vector<std::string> &hashes) override
   {
     if (hashes.empty())
-      return;
+      return true;
 
     try
     {

@@ -30,8 +30,8 @@ public:
   // 4. Returns a list of orphaned chunks which have not been commmited to any file
   virtual std::vector<OrphanedChunk> GetOrphanedChunks(int expiry_hours, int limit) = 0;
 
-  // 5. Deletes a chunk record from the database
-  virtual void DeleteChunkRecord(const std::string &hash) = 0;
+  // UPDATED: Now accepts a vector of hashes for a single bulk SQL transaction
+  virtual bool DeleteChunkRecordsBulk(const std::vector<std::string> &hashes) = 0;
 
   // 6. Tombstone recovery
   virtual void RevertTombstone(const std::string &hash) = 0;
