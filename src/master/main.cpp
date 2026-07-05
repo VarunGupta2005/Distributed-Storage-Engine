@@ -1,5 +1,6 @@
 #include "MasterServer.hpp"
 #include "PostgresRepository.hpp"
+#include "../common/httplib.h"
 #include <iostream>
 #include <string>
 #include <cstdlib>
@@ -13,16 +14,20 @@
 #include <chrono>
 #include <csignal>
 #include <algorithm>
+#include <exception> // Required for std::current_exception
 
-// ASYNC-SIGNAL-SAFE GLOBAL STATE (Strict POSIX Compliance)
-// volatile std::sig_atomic_t is safe to write inside signal handlers
+// Global state for signal handling and background thread synchronization.
+// volatile std::sig_atomic_t ensures atomic access when modified inside a signal handler.
 volatile std::sig_atomic_t shutdown_requested = 0;
 
 std::atomic<bool> keep_running{true};
 std::mutex gc_mutex;
 std::condition_variable gc_cv;
 
-// Signal handler only sets a primitive flag and returns immediately (No UB)
+// Thread pool to manage concurrent execution of background deletion tasks.
+httplib::ThreadPool gc_thread_pool(16);
+
+// Signal handler sets the flag to notify the event loop of a shutdown request.
 void SignalHandler(int signal)
 {
   if (signal == SIGINT || signal == SIGTERM)
@@ -31,61 +36,77 @@ void SignalHandler(int signal)
   }
 }
 
-// PARALLEL PHYSICAL DELETION PIPELINES (THE DATA PLANE)
-// LEVEL 1: Delete all physical replicas of ONE chunk from its Workers in parallel
+// Deletes replicas of a single chunk sequentially to manage concurrent socket usage.
 bool DeletePhysicalChunkFromWorkers(const OrphanedChunk &orphan)
 {
-  std::vector<std::future<bool>> futures;
+  bool all_success = true;
 
   for (const auto &loc : orphan.locations)
   {
-    futures.push_back(std::async(std::launch::async, [loc, orphan]()
-                                 {
-            httplib::Client worker_client(loc.host, loc.port);
-            worker_client.set_connection_timeout(1, 0); // 1-second timeout guard
-            
-            auto res = worker_client.Delete("/chunk?hash=" + orphan.hash);
-            return (res && res->status == 200); }));
-  }
+    httplib::Client worker_client(loc.host, loc.port);
+    worker_client.set_connection_timeout(1, 0); // 1-second connection timeout limit
 
-  bool all_success = true;
-  for (auto &fut : futures)
-  {
-    if (!fut.get())
+    auto res = worker_client.Delete("/chunk?hash=" + orphan.hash);
+
+    if (!res || res->status != 200)
     {
+      std::cerr << "[GC ERROR] Worker " << loc.host << ":" << loc.port << " failed to delete " << orphan.hash << "\n";
       all_success = false;
     }
   }
+
   return all_success;
 }
 
-// LEVEL 2: Delete ALL chunks in the batch concurrently over the network
+// Processes deletion of a batch of chunks concurrently by dispatching tasks to the thread pool.
 std::unordered_set<std::string> PurgeOrphanBatchParallel(const std::vector<OrphanedChunk> &orphans)
 {
   std::vector<std::future<std::pair<std::string, bool>>> futures;
 
   for (const auto &orphan : orphans)
   {
-    futures.push_back(std::async(std::launch::async, [orphan]() -> std::pair<std::string, bool>
-                                 {
+    // Use a shared promise to retrieve results from tasks queued in the thread pool.
+    auto promise = std::make_shared<std::promise<std::pair<std::string, bool>>>();
+    futures.push_back(promise->get_future());
+
+    gc_thread_pool.enqueue([promise, orphan]()
+                           {
+        // Catch any exceptions to prevent blocking on the associated future.
+        try {
             bool success = DeletePhysicalChunkFromWorkers(orphan);
-            return {orphan.hash, success}; }));
+            promise->set_value({orphan.hash, success});
+        } catch (...) {
+            promise->set_exception(std::current_exception());
+        } });
   }
 
   std::unordered_set<std::string> successfully_deleted_hashes;
   for (auto &fut : futures)
   {
-    auto result = fut.get();
-    if (result.second)
+    try
     {
-      successfully_deleted_hashes.insert(result.first); // O(1) hash insertion
+      // Blocks until the task completes; retrieves the result or rethrows exceptions.
+      auto result = fut.get();
+      if (result.second)
+      {
+        successfully_deleted_hashes.insert(result.first);
+      }
+    }
+    // Isolate exceptions to individual tasks so successful deletions can still be committed.
+    catch (const std::exception &e)
+    {
+      std::cerr << "[GC ERROR] Deletion task threw exception: " << e.what() << "\n";
+    }
+    catch (...)
+    {
+      std::cerr << "[GC ERROR] Deletion task threw an unknown exception.\n";
     }
   }
 
   return successfully_deleted_hashes;
 }
 
-// THE BACKGROUND DAEMON THREAD (Fault-Tolerant)
+// Background thread daemon responsible for periodic cleanup of orphaned chunks.
 void GarbageCollectorDaemon(IMetadataRepository *db)
 {
   int expiry_hours = 24;
@@ -95,8 +116,7 @@ void GarbageCollectorDaemon(IMetadataRepository *db)
 
   while (keep_running)
   {
-    // Exception safety wrapper: Prevents a temporary database or network
-    // disconnect from permanently killing the background thread
+    // Prevent database or network errors from terminating the background thread.
     try
     {
       std::cout << "[GC DAEMON] Initiating scheduled database sweep...\n";
@@ -110,24 +130,25 @@ void GarbageCollectorDaemon(IMetadataRepository *db)
           break;
         }
 
-        // Parallel physical network purge
+        // Delete the current batch of orphaned chunks from storage nodes.
         std::unordered_set<std::string> successful_purges = PurgeOrphanBatchParallel(orphans);
         bool delete_success = true;
+
         if (!successful_purges.empty())
         {
-          // Bulk database deletion in a single SQL transaction
+          // Convert set of successful deletions to a vector for the bulk database update.
           std::vector<std::string> purged_list;
           for (const auto &hash : successful_purges)
           {
             purged_list.push_back(hash);
           }
+          // Commit successful deletions in a single database operation.
           delete_success = db->DeleteChunkRecordsBulk(purged_list);
 
           total_deleted += delete_success ? successful_purges.size() : 0;
         }
 
-        // RECOVERY: Revert failed tombstones.
-        // count() on std::unordered_set is an O(1) lookup, reducing loop complexity to O(N)!
+        // Revert tombstone states in the database if deletion fails.
         if (!delete_success)
         {
           for (auto &orphan : orphans)
@@ -137,6 +158,7 @@ void GarbageCollectorDaemon(IMetadataRepository *db)
         }
         else
         {
+          // Identify and revert only the chunks that failed deletion.
           for (const auto &orphan : orphans)
           {
             if (successful_purges.count(orphan.hash) == 0)
@@ -157,7 +179,7 @@ void GarbageCollectorDaemon(IMetadataRepository *db)
       std::cerr << "[GC DAEMON ERROR] Retrying on next scheduled sweep...\n";
     }
 
-    // Interruptible sleep using Condition Variables
+    // Sleep for 24 hours, or wake up early if notified of a shutdown.
     std::unique_lock<std::mutex> lock(gc_mutex);
     std::cout << "[GC DAEMON] Sleeping for 24 hours (Interruptible)...\n";
     gc_cv.wait_for(lock, std::chrono::hours(24), []
@@ -166,7 +188,7 @@ void GarbageCollectorDaemon(IMetadataRepository *db)
   std::cout << "[GC DAEMON] Background thread exiting gracefully.\n";
 }
 
-// ENTRY POINT
+// Program entry point
 int main(int argc, char *argv[])
 {
   int port = 8081;
@@ -176,7 +198,7 @@ int main(int argc, char *argv[])
     port = std::stoi(argv[1]);
   }
 
-  // 1. Set up signal handling first thing (POSIX Standard)
+  // Set up handlers for termination signals.
   std::signal(SIGINT, SignalHandler);  // Catches Ctrl+C
   std::signal(SIGTERM, SignalHandler); // Catches Docker kill commands
 
@@ -185,10 +207,10 @@ int main(int argc, char *argv[])
 
   PostgresRepository repo(conn_str);
 
-  // 2. Start the Background GC Thread
+  // Start the background Garbage Collector thread.
   std::thread gc_thread(GarbageCollectorDaemon, &repo);
 
-  // 3. Start the HTTP Server in a separate thread so main() remains free to monitor signals
+  // Run the HTTP server in a separate thread to allow the main thread to monitor signals.
   MasterServer server(port, &repo);
   std::thread server_thread([&server, port]()
                             { server.Listen(port); });
@@ -196,15 +218,13 @@ int main(int argc, char *argv[])
   std::cout << "[INIT] Master Node booting up on port " << port << "...\n";
   std::cout << "[INIT] Connecting to PostgreSQL on " << db_host << ":5432...\n";
 
-  // 4. MAIN THREAD EVENT LOOP (100% Async-Signal-Safe)
-  // The main thread simply sleeps in 100ms intervals. If a signal arrives,
-  // the signal handler writes to 'shutdown_requested' natively.
+  // Main event loop that periodically checks the shutdown flag.
   while (shutdown_requested == 0)
   {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
 
-  // GRACEFUL SHUTDOWN (Executed safely outside of the signal handler context)
+  // Graceful shutdown sequence.
   std::cout << "\n[SHUTDOWN] Shutdown requested. Stopping HTTP server...\n";
   server.Stop();
 
@@ -215,7 +235,7 @@ int main(int argc, char *argv[])
 
   std::cout << "[SHUTDOWN] Stopping GC background daemon...\n";
   keep_running = false;
-  gc_cv.notify_all(); // Safe to notify now
+  gc_cv.notify_all(); // Wake up the background daemon thread to allow it to exit.
 
   if (gc_thread.joinable())
   {
