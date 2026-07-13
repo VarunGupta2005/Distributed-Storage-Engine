@@ -1,6 +1,7 @@
 #pragma once
 #include <string>
 #include <vector>
+
 struct WorkerLocation
 {
   std::string host;
@@ -13,26 +14,50 @@ struct OrphanedChunk
   std::vector<WorkerLocation> locations;
 };
 
+struct UserRecord
+{
+  bool found = false;
+  int id = 0;
+  std::string password_hash;
+  std::string salt;
+};
+
 class IMetadataRepository
 {
 public:
   virtual ~IMetadataRepository() = default;
 
-  // 1. Returns the version of the database
+  // --- CONNECTIVITY ---
+  // Returns the version of the database to verify connectivity.
   virtual std::string GetDatabaseVersion() = 0;
 
-  // 2. Returns a list of hashes that DO NOT exist in the database yet
+  // --- AUTHENTICATION ---
+  // Inserts a new user into the database. Returns false if the email already exists.
+  virtual bool CreateUser(const std::string &email, const std::string &password_hash, const std::string &salt) = 0;
+
+  // Retrieves user credentials by email for authentication verification.
+  virtual UserRecord GetUserByEmail(const std::string &email) = 0;
+
+  // --- WORKER NODE DISCOVERY ---
+  // Registers or updates a Worker Node via its heartbeat payload using the Dual-Identity routing model.
+  virtual void RegisterWorker(const std::string &internal_host, int internal_port,
+                              const std::string &advertised_host, int advertised_port,
+                              long long free_space) = 0;
+
+  // --- DEDUPLICATION & STORAGE ---
+  // Filters out existing chunks and pre-registers missing ones with ref_count = 0.
   virtual std::vector<std::string> FilterMissingChunks(const std::vector<std::string> &client_hashes) = 0;
 
-  // 3. Creates the file record and increments the ref_count for these chunks
+  // Finalizes the two-phase commit by creating the file record and incrementing ref_counts.
   virtual void CommitFile(const std::string &filename, long long file_size, const std::vector<std::string> &chunk_hashes) = 0;
 
-  // 4. Returns a list of orphaned chunks which have not been commmited to any file
+  // --- GARBAGE COLLECTION ---
+  // Returns a list of orphaned chunks (ref_count = 0) older than the TTL, locking them as tombstones (-1).
   virtual std::vector<OrphanedChunk> GetOrphanedChunks(int expiry_hours, int limit) = 0;
 
-  // UPDATED: Now accepts a vector of hashes for a single bulk SQL transaction
+  // Deletes metadata records for chunks that were successfully purged from physical worker nodes.
   virtual bool DeleteChunkRecordsBulk(const std::vector<std::string> &hashes) = 0;
 
-  // 6. Tombstone recovery
+  // Reverts a tombstoned chunk (-1) back to pending (0) if the physical deletion fails.
   virtual void RevertTombstone(const std::string &hash) = 0;
 };

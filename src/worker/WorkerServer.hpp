@@ -61,4 +61,9 @@ public:
     {
         svr.listen("0.0.0.0", port);
     }
+
+    void Stop()
+    {
+        svr.stop();
+    }
 };
