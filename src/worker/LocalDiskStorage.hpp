@@ -1,14 +1,19 @@
 #pragma once
 #include "IStorageBackend.hpp"
+#include "../common/crypto.hpp"
 #include <filesystem>
 #include <fstream>
+#include <vector>
 #include <iostream>
 #include <system_error>
 #include <stdexcept>
 #include <mutex>
+#include <cstdlib>
 
 class LocalDiskStorage : public IStorageBackend
 {
+  const unsigned char *node_key;
+
 private:
   std::filesystem::path storage_dir;
   std::mutex storage_mutex;      // Protects disk space queries and in-flight reservations
@@ -41,7 +46,7 @@ private:
 
 public:
   // Initializes the storage directory. Throws on failure to prevent operations without valid storage.
-  LocalDiskStorage(const std::string &dir) : storage_dir(dir)
+  LocalDiskStorage(const std::string &dir, const unsigned char *key) : storage_dir(dir), node_key(key)
   {
     std::error_code ec;
     std::filesystem::create_directories(storage_dir, ec);
@@ -55,7 +60,21 @@ public:
   // Reserves space, writes the chunk data, and releases the reservation.
   bool SaveChunk(const std::string &hash, const std::vector<char> &data) override
   {
-    if (!ReserveSpace(data.size()))
+    std::vector<char> encrypted_data;
+
+    // Encrypt the raw client payload in memory using AES-256-CBC
+    try
+    {
+      encrypted_data = EncryptBytes(data, node_key);
+    }
+    catch (const std::exception &e)
+    {
+      std::cerr << "[I/O ERROR] Encryption failed for " << hash << ": " << e.what() << "\n";
+      return false; // Safely fail-fast before making any database or disk reservations [16]
+    }
+
+    // Check and reserve the exact physical write size in memory before starting disk I/O
+    if (!ReserveSpace(encrypted_data.size()))
     {
       std::cerr << "[I/O WARNING] Refused write for " << hash << ": Insufficient disk space.\n";
       return false;
@@ -66,20 +85,22 @@ public:
 
     if (!file.is_open())
     {
+      // Release the exact reservation under the lock on file open failure
       std::lock_guard<std::mutex> lock(storage_mutex);
-      in_flight_bytes -= data.size();
+      in_flight_bytes -= encrypted_data.size();
       return false;
     }
 
-    file.write(data.data(), data.size());
+    file.write(encrypted_data.data(), encrypted_data.size());
 
     // Flush the stream to the OS cache before evaluating success.
     file.flush();
     bool success = file.good();
 
+    // Release the exact reservation under the lock
     {
       std::lock_guard<std::mutex> lock(storage_mutex);
-      in_flight_bytes -= data.size();
+      in_flight_bytes -= encrypted_data.size();
     }
 
     return success;
@@ -104,7 +125,15 @@ public:
     std::vector<char> buffer(size);
     if (file.read(buffer.data(), size))
     {
-      return buffer;
+      try
+      {
+        return DecryptBytes(buffer, node_key);
+      }
+      catch (const std::exception &e)
+      {
+        std::cerr << "[I/O ERROR] Decryption failed for " << hash << ": " << e.what() << "\n";
+        return {};
+      }
     }
     return {};
   }

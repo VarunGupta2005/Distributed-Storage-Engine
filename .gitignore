@@ -20,3 +20,4 @@ CMakeFiles/
 
 # Local database volumes 
 pgdata/
+data/

@@ -111,8 +111,21 @@ int main(int argc, char *argv[])
 
   std::string storage_dir = "./data/node_" + std::to_string(port);
 
+  const char *key = std::getenv("AES_KEY");
+  if (!key)
+  {
+    std::cerr << "[INIT ERROR] AES_KEY environment variable not set.\n";
+    return EXIT_FAILURE;
+  }
+  if (std::strlen(key) != 32)
+  {
+    std::cerr << "[INIT ERROR] AES_KEY must be exactly 32 bytes.\n";
+    return EXIT_FAILURE;
+  }
+  const unsigned char *node_key = reinterpret_cast<const unsigned char *>(key);
+
   // Initialize the physical storage backend.
-  LocalDiskStorage storage(storage_dir);
+  LocalDiskStorage storage(storage_dir, node_key);
 
   // Start the background heartbeat telemetry thread.
   std::thread hb_thread(HeartbeatDaemon, master_lb, internal_host, advertised_host, port, storage_dir);

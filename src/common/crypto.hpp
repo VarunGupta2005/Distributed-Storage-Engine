@@ -16,13 +16,9 @@ constexpr int PBKDF2_ITERATIONS = 100000;
 // DATA PLANE CRYPTOGRAPHY (AES-256-CBC)
 // ============================================================================
 
-// 32-byte Key for at-rest encryption (In production, load this from environment variables)
-const unsigned char AES_KEY[32] = {
-    'm', 'y', '_', 'u', 'l', 't', 'r', 'a', '_', 's', 'e', 'c', 'u', 'r', 'e', '_',
-    '3', '2', '_', 'b', 'y', 't', 'e', '_', 'a', 'e', 's', '_', 'k', 'e', 'y', '!'};
-
 // Encrypts raw binary data utilizing AES-256-CBC and prepends a randomized 16-byte IV.
-inline std::vector<char> EncryptBytes(const std::vector<char> &raw_data)
+// key must point to a valid 32-byte AES-256 key.
+inline std::vector<char> EncryptBytes(const std::vector<char> &raw_data, const unsigned char *AES_KEY)
 {
   unsigned char iv[16];
   if (RAND_bytes(iv, sizeof(iv)) != 1)
@@ -72,7 +68,7 @@ inline std::vector<char> EncryptBytes(const std::vector<char> &raw_data)
 }
 
 // Extracts the prepended 16-byte IV and decrypts the remaining AES-256-CBC payload.
-inline std::vector<char> DecryptBytes(const std::vector<char> &file_data)
+inline std::vector<char> DecryptBytes(const std::vector<char> &file_data, const unsigned char *AES_KEY)
 {
   if (file_data.size() < 16)
   {

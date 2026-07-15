@@ -15,6 +15,7 @@ private:
 public:
   PostgresRepository(const std::string &conn_str) : connection_string(conn_str) {}
 
+  // --- CONNECTIVITY TEST ---
   std::string GetDatabaseVersion() override
   {
     pqxx::connection conn(connection_string);
@@ -24,6 +25,10 @@ public:
     return res[0][0].as<std::string>();
   }
 
+  // --- AUTHENTICATION ---
+
+  // Inserts a new user record. Uses parameterized queries to prevent SQL injection.
+  // Returns false if a unique constraint violation occurs (e.g., email already exists).
   bool CreateUser(const std::string &email, const std::string &password_hash, const std::string &salt) override
   {
     try
@@ -41,10 +46,11 @@ public:
     catch (const std::exception &e)
     {
       std::cerr << "[DB ERROR] Failed to create user: " << e.what() << "\n";
-      return false; // Typically a unique constraint violation (email exists)
+      return false;
     }
   }
 
+  // Retrieves user credentials based on email for session token generation.
   UserRecord GetUserByEmail(const std::string &email) override
   {
     UserRecord record;
@@ -73,6 +79,10 @@ public:
     return record;
   }
 
+  // --- WORKER NODE DISCOVERY ---
+
+  // Executes an atomic UPSERT to register or update a Worker Node.
+  // Refreshes the last_heartbeat timestamp and updates capacity metrics.
   void RegisterWorker(const std::string &internal_host, int internal_port,
                       const std::string &advertised_host, int advertised_port,
                       long long free_space) override
@@ -103,6 +113,7 @@ public:
     }
   }
 
+  // --- DEDUPLICATION CHECK & LEASE RENEWAL ---
   std::vector<std::string> FilterMissingChunks(const std::vector<std::string> &client_hashes) override
   {
     std::vector<std::string> missing_hashes;
@@ -111,17 +122,19 @@ public:
 
     for (const auto &hash : client_hashes)
     {
+      // Fetch the actual ref_count to categorize the chunk's lifecycle state
       pqxx::result res = txn.exec_params(
           "SELECT ref_count FROM chunks WHERE chunk_hash = $1", hash);
 
       if (res.empty())
       {
+        // STATE A: Chunk is missing. Pre-register with ref_count = 0 (Two-Phase Commit).
         missing_hashes.push_back(hash);
         txn.exec_params(
             "INSERT INTO chunks (chunk_hash, nodes, ref_count, created_at) VALUES ($1, $2, 0, CURRENT_TIMESTAMP) "
             "ON CONFLICT (chunk_hash) DO NOTHING",
             hash,
-            "{worker_1:9001, worker_2:9002}"); // Hardcoded ports to be replaced dynamically by routing logic
+            "{127.0.0.1:9001, 127.0.0.1:9002}"); // To be replaced dynamically by routing logic
       }
       else
       {
@@ -133,13 +146,17 @@ public:
         }
         else
         {
+          // LEASE RENEWAL: Reset the 24-hour GC countdown timer.
           txn.exec_params(
-              "UPDATE chunks SET created_at = CURRENT_TIMESTAMP WHERE chunk_hash = $1", hash);
+              "UPDATE chunks SET created_at = CURRENT_TIMESTAMP WHERE chunk_hash = $1",
+              hash);
 
           if (ref_count == 0)
           {
+            // STATE C: Aborted/Uncommitted upload. Force client to upload/overwrite it.
             missing_hashes.push_back(hash);
           }
+          // STATE D: ref_count > 0. Healthy, committed chunk. Skipped safely.
         }
       }
     }
@@ -147,11 +164,13 @@ public:
     return missing_hashes;
   }
 
+  // --- TWO-PHASE COMMIT ---
   void CommitFile(const std::string &filename, long long file_size, const std::vector<std::string> &chunk_hashes) override
   {
     pqxx::connection conn(connection_string);
     pqxx::work txn(conn);
 
+    // 1. Convert C++ vector to PostgreSQL native array format: e.g., {hash1,hash2}
     std::string pg_array = "{";
     for (size_t i = 0; i < chunk_hashes.size(); ++i)
     {
@@ -161,19 +180,27 @@ public:
     }
     pg_array += "}";
 
+    // 2. Insert the finalized file record (Hardcoding user_id = 1 for MVP)
     txn.exec_params(
         "INSERT INTO files (user_id, filename, size, chunks) VALUES (1, $1, $2, $3)",
-        filename, file_size, pg_array);
+        filename,
+        file_size,
+        pg_array);
 
+    // 3. Batch update: transition all chunks in this file from pending (0) to active (1+)
+    // Also updates the 'created_at' timestamp to ensure that if this chunk ever drops back
+    // to a reference count of 0, the 24-hour deletion grace period starts from that deletion time.
     for (const auto &hash : chunk_hashes)
     {
       txn.exec_params(
-          "UPDATE chunks SET ref_count = ref_count + 1 WHERE chunk_hash = $1", hash);
+          "UPDATE chunks SET ref_count = ref_count + 1, created_at = CURRENT_TIMESTAMP WHERE chunk_hash = $1",
+          hash);
     }
 
     txn.commit();
   }
 
+  // --- COOPERATIVE ORPHANED CHUNKS MANAGEMENT ---
   std::vector<OrphanedChunk> GetOrphanedChunks(int expiry_hours, int limit) override
   {
     std::vector<OrphanedChunk> orphans;
@@ -182,6 +209,8 @@ public:
       pqxx::connection conn(connection_string);
       pqxx::work txn(conn);
 
+      // Atomic UPDATE + RETURNING using SKIP LOCKED.
+      // Modifies target rows from 0 to -1, preventing concurrent transactions from selecting them.
       std::string query =
           "UPDATE chunks SET ref_count = -1 "
           "WHERE chunk_hash IN ("
@@ -201,10 +230,12 @@ public:
         OrphanedChunk orphan;
         orphan.hash = row[0].as<std::string>();
 
+        // Parse PostgreSQL array string e.g., "{worker_1:9001, worker_2:9002}"
         std::string array_str = row[1].as<std::string>();
         if (array_str.size() > 2)
         {
           array_str = array_str.substr(1, array_str.size() - 2);
+
           std::stringstream ss(array_str);
           std::string node_str;
 
@@ -232,6 +263,7 @@ public:
     return orphans;
   }
 
+  // --- SAFETY GATED DELETION ---
   bool DeleteChunkRecordsBulk(const std::vector<std::string> &hashes) override
   {
     if (hashes.empty())
@@ -254,6 +286,7 @@ public:
       pqxx::result res = txn.exec(query);
       txn.commit();
 
+      std::cout << "[GC] Bulk purged " << res.affected_rows() << " records from PostgreSQL.\n";
       return true;
     }
     catch (const std::exception &e)
@@ -263,6 +296,7 @@ public:
     return false;
   }
 
+  // --- FAILOVER RECOVERY ---
   void RevertTombstone(const std::string &hash) override
   {
     try
@@ -270,10 +304,16 @@ public:
       pqxx::connection conn(connection_string);
       pqxx::work txn(conn);
 
+      // Reverts -1 to 0 and resets the 'created_at' lease timestamp.
+      // This grants the failed/offline Worker Node a fresh 24-hour lease window to recover,
+      // preventing the Garbage Collector from immediately re-sweeping it on the next loop.
       txn.exec_params(
-          "UPDATE chunks SET ref_count = 0 WHERE chunk_hash = $1 AND ref_count = -1;", hash);
+          "UPDATE chunks SET ref_count = 0, created_at = CURRENT_TIMESTAMP "
+          "WHERE chunk_hash = $1 AND ref_count = -1;",
+          hash);
 
       txn.commit();
+      std::cout << "[GC RECOVERY] Reverted tombstone back to pending for chunk: " << hash << "\n";
     }
     catch (const std::exception &e)
     {
