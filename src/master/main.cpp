@@ -45,6 +45,8 @@ bool DeletePhysicalChunkFromWorkers(const OrphanedChunk &orphan)
   {
     httplib::Client worker_client(loc.host, loc.port);
     worker_client.set_connection_timeout(1, 0); // 1-second connection timeout limit
+    worker_client.set_read_timeout(2, 0);
+    worker_client.set_write_timeout(2, 0);
 
     auto res = worker_client.Delete("/chunk?hash=" + orphan.hash);
 
@@ -202,21 +204,41 @@ int main(int argc, char *argv[])
   std::signal(SIGINT, SignalHandler);  // Catches Ctrl+C
   std::signal(SIGTERM, SignalHandler); // Catches Docker kill commands
 
-  const char *db_host = std::getenv("DB_HOST") ? std::getenv("DB_HOST") : "127.0.0.1";
-  std::string conn_str = "user=postgres password=password host=" + std::string(db_host) + " port=5432 dbname=metadata";
+  const char *env_db_url = std::getenv("DATABASE_URL");
+  std::string conn_str = env_db_url ? env_db_url : "postgresql://postgres:password@127.0.0.1:5432/metadata";
 
-  PostgresRepository repo(conn_str);
+  const char *env_buckets = std::getenv("NUM_BUCKETS");
+  const char *env_cluster_secret = std::getenv("CLUSTER_SECRET");
+  const char *env_session_secret = std::getenv("SESSION_SECRET");
+
+  std::string cluster_secret = env_cluster_secret ? env_cluster_secret : "my_shared_secret_key";
+  std::string session_secret = env_session_secret ? env_session_secret : "my_shared_secret_key";
+
+  int num_buckets = 256;
+  if (env_buckets)
+  {
+    try
+    {
+      num_buckets = std::stoi(env_buckets);
+    }
+    catch (...)
+    {
+      num_buckets = 256;
+    }
+  }
+
+  PostgresRepository repo(conn_str, num_buckets);
 
   // Start the background Garbage Collector thread.
   std::thread gc_thread(GarbageCollectorDaemon, &repo);
 
   // Run the HTTP server in a separate thread to allow the main thread to monitor signals.
-  MasterServer server(port, &repo);
+  MasterServer server(port, &repo, cluster_secret, session_secret);
   std::thread server_thread([&server, port]()
                             { server.Listen(port); });
 
   std::cout << "[INIT] Master Node booting up on port " << port << "...\n";
-  std::cout << "[INIT] Connecting to PostgreSQL on " << db_host << ":5432...\n";
+  std::cout << "[INIT] Using PostgreSQL connection string from configuration.\n";
 
   // Main event loop that periodically checks the shutdown flag.
   while (shutdown_requested == 0)

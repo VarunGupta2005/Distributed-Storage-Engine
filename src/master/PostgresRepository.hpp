@@ -12,8 +12,86 @@ class PostgresRepository : public IMetadataRepository
 private:
   std::string connection_string;
 
+  const int num_buckets; // Decoupled partition dimension
+
+  // Helper for translating JSON node data directly into structures
+  MissingChunkPlan ParseNodePlanFromJson(const std::string &hash, const std::string &json_nodes_data)
+  {
+    MissingChunkPlan plan;
+    plan.hash = hash;
+
+    if (json_nodes_data.empty() || json_nodes_data == "null")
+      return plan;
+
+    auto nodes_json = nlohmann::json::parse(json_nodes_data);
+    for (const auto &item : nodes_json)
+    {
+      NodeInfo info;
+      info.internal_coord = item["internal_coord"].get<std::string>();
+      info.advertised_host = item["advertised_host"].get<std::string>();
+      info.advertised_port = item["advertised_port"].get<int>();
+      plan.assigned_nodes.push_back(info);
+    }
+    return plan;
+  }
+
+  // Computes the logical partition (bucket) for a given SHA-256 hash.
+  inline int CalculateBucketId(const std::string &sha256_hex, int num_buckets)
+  {
+    if (sha256_hex.length() < 8)
+      return 0;
+    try
+    {
+      std::string prefix = sha256_hex.substr(0, 8);
+      unsigned int hash_int = std::stoul(prefix, nullptr, 16);
+      return hash_int % num_buckets;
+    }
+    catch (...)
+    {
+      return 0; // Fallback for invalid hash format
+    }
+  }
+
+  // Transactionally validates that all provided worker IDs exist in the database.
+  // Throws standard runtime errors on empty lists or missing keys to force transaction rollback.
+  void VerifyNodesExist(pqxx::work &txn, const std::vector<int> &node_ids)
+  {
+    if (node_ids.empty())
+    {
+      throw std::runtime_error("Validation failed: Worker ID list cannot be empty.");
+    }
+
+    // Deduplicate elements to ensure exact comparison count against sql return value
+    std::unordered_set<int> unique_ids(node_ids.begin(), node_ids.end());
+
+    std::string pg_array = "{";
+    size_t index = 0;
+    for (int id : unique_ids)
+    {
+      pg_array += std::to_string(id);
+      if (++index < unique_ids.size())
+      {
+        pg_array += ",";
+      }
+    }
+    pg_array += "}";
+
+    // Verify existences of the parsed IDs
+    pqxx::result count_res = txn.exec_params(
+        "SELECT COUNT(*) FROM worker_nodes WHERE worker_id = ANY($1::integer[])",
+        pg_array);
+
+    int valid_count = count_res[0][0].as<int>();
+    if (valid_count != static_cast<int>(unique_ids.size()))
+    {
+      throw std::runtime_error("Validation failed: One or more provided worker IDs do not exist.");
+    }
+  }
+
 public:
-  PostgresRepository(const std::string &conn_str) : connection_string(conn_str) {}
+  PostgresRepository(const std::string &conn_str, const int &buckets) : connection_string(conn_str), num_buckets(buckets)
+  {
+  }
 
   // --- CONNECTIVITY TEST ---
   std::string GetDatabaseVersion() override
@@ -93,15 +171,18 @@ public:
       pqxx::work txn(conn);
 
       txn.exec_params(
-          "INSERT INTO worker_nodes (internal_host, internal_port, advertised_host, advertised_port, free_space, last_heartbeat) "
-          "VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP) "
+          "INSERT INTO worker_nodes (internal_host, internal_port, advertised_host, advertised_port, free_space, last_heartbeat, status) "
+          "VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP, 'ACTIVE') "
           "ON CONFLICT (internal_host, internal_port) "
           "DO UPDATE SET "
           "    advertised_host = EXCLUDED.advertised_host, "
           "    advertised_port = EXCLUDED.advertised_port, "
           "    free_space = EXCLUDED.free_space, "
           "    last_heartbeat = CURRENT_TIMESTAMP, "
-          "    status = 'ACTIVE';",
+          "    status = CASE "
+          "                 WHEN worker_nodes.status = 'READ_ONLY' THEN 'READ_ONLY' "
+          "                 ELSE 'ACTIVE' "
+          "             END;",
           internal_host, internal_port, advertised_host, advertised_port, free_space);
 
       txn.commit();
@@ -113,28 +194,57 @@ public:
     }
   }
 
-  // --- DEDUPLICATION CHECK & LEASE RENEWAL ---
-  std::vector<std::string> FilterMissingChunks(const std::vector<std::string> &client_hashes) override
+  // --- DEDUPLICATION CHECK & SHARD ROUTING ---
+  std::vector<MissingChunkPlan> FilterMissingChunks(const std::vector<std::string> &client_hashes) override
   {
-    std::vector<std::string> missing_hashes;
+    std::vector<MissingChunkPlan> missing_plans;
     pqxx::connection conn(connection_string);
     pqxx::work txn(conn);
 
     for (const auto &hash : client_hashes)
     {
-      // Fetch the actual ref_count to categorize the chunk's lifecycle state
+      // Subquery resolves worker_ids to JSON objects containing network coordinates
       pqxx::result res = txn.exec_params(
-          "SELECT ref_count FROM chunks WHERE chunk_hash = $1", hash);
+          "SELECT ref_count, nodes, "
+          "(SELECT json_agg(json_build_object("
+          "   'internal_coord', internal_host || ':' || internal_port, "
+          "   'advertised_host', advertised_host, "
+          "   'advertised_port', advertised_port"
+          ")) FROM worker_nodes WHERE worker_id = ANY(chunks.nodes)) AS node_data "
+          "FROM chunks WHERE chunk_hash = $1",
+          hash);
 
       if (res.empty())
       {
-        // STATE A: Chunk is missing. Pre-register with ref_count = 0 (Two-Phase Commit).
-        missing_hashes.push_back(hash);
+        int bucket_id = CalculateBucketId(hash, num_buckets);
+
+        // Fetch routing map and resolve worker coordinates in a single query
+        pqxx::result routing_res = txn.exec_params(
+            "SELECT c.active_nodes, "
+            "(SELECT json_agg(json_build_object("
+            "   'internal_coord', internal_host || ':' || internal_port, "
+            "   'advertised_host', advertised_host, "
+            "   'advertised_port', advertised_port"
+            ")) FROM worker_nodes WHERE worker_id = ANY(c.active_nodes)) AS node_data "
+            "FROM shard_map s "
+            "JOIN clusters c ON s.cluster_id = c.cluster_id "
+            "WHERE s.bucket_id = $1",
+            bucket_id);
+
+        if (routing_res.empty())
+        {
+          throw std::runtime_error("Shard map uninitialized for bucket " + std::to_string(bucket_id));
+        }
+
+        std::string pg_nodes_array = routing_res[0][0].as<std::string>();
+        std::string json_nodes_data = routing_res[0][1].as<std::string>();
+
         txn.exec_params(
             "INSERT INTO chunks (chunk_hash, nodes, ref_count, created_at) VALUES ($1, $2, 0, CURRENT_TIMESTAMP) "
             "ON CONFLICT (chunk_hash) DO NOTHING",
-            hash,
-            "{127.0.0.1:9001, 127.0.0.1:9002}"); // To be replaced dynamically by routing logic
+            hash, pg_nodes_array);
+
+        missing_plans.push_back(ParseNodePlanFromJson(hash, json_nodes_data));
       }
       else
       {
@@ -146,24 +256,19 @@ public:
         }
         else
         {
-          // LEASE RENEWAL: Reset the 24-hour GC countdown timer.
-          txn.exec_params(
-              "UPDATE chunks SET created_at = CURRENT_TIMESTAMP WHERE chunk_hash = $1",
-              hash);
+          txn.exec_params("UPDATE chunks SET created_at = CURRENT_TIMESTAMP WHERE chunk_hash = $1", hash);
 
           if (ref_count == 0)
           {
-            // STATE C: Aborted/Uncommitted upload. Force client to upload/overwrite it.
-            missing_hashes.push_back(hash);
+            std::string json_nodes_data = res[0][2].as<std::string>();
+            missing_plans.push_back(ParseNodePlanFromJson(hash, json_nodes_data));
           }
-          // STATE D: ref_count > 0. Healthy, committed chunk. Skipped safely.
         }
       }
     }
     txn.commit();
-    return missing_hashes;
+    return missing_plans;
   }
-
   // --- TWO-PHASE COMMIT ---
   void CommitFile(const std::string &filename, long long file_size, const std::vector<std::string> &chunk_hashes) override
   {
@@ -209,19 +314,20 @@ public:
       pqxx::connection conn(connection_string);
       pqxx::work txn(conn);
 
-      // Atomic UPDATE + RETURNING using SKIP LOCKED.
-      // Modifies target rows from 0 to -1, preventing concurrent transactions from selecting them.
+      // Uses a Common Table Expression (CTE) to lock rows and resolve node JSON concurrently
       std::string query =
-          "UPDATE chunks SET ref_count = -1 "
-          "WHERE chunk_hash IN ("
-          "  SELECT chunk_hash FROM chunks "
-          "  WHERE ref_count = 0 "
-          "    AND created_at < NOW() - INTERVAL '" +
-          std::to_string(expiry_hours) + " hours' "
-                                         "  FOR UPDATE SKIP LOCKED "
-                                         "  LIMIT " +
-          std::to_string(limit) + " "
-                                  ") RETURNING chunk_hash, nodes;";
+          "WITH updated AS ("
+          "  UPDATE chunks SET ref_count = -1 "
+          "  WHERE chunk_hash IN ("
+          "    SELECT chunk_hash FROM chunks WHERE ref_count = 0 AND created_at < NOW() - INTERVAL '" +
+          std::to_string(expiry_hours) + " hours' FOR UPDATE SKIP LOCKED LIMIT " +
+          std::to_string(limit) +
+          "  ) RETURNING chunk_hash, nodes"
+          ") "
+          "SELECT u.chunk_hash, "
+          "(SELECT json_agg(json_build_object('host', w.internal_host, 'port', w.internal_port)) "
+          " FROM worker_nodes w WHERE w.worker_id = ANY(u.nodes)) AS locations "
+          "FROM updated u;";
 
       pqxx::result res = txn.exec(query);
 
@@ -230,30 +336,18 @@ public:
         OrphanedChunk orphan;
         orphan.hash = row[0].as<std::string>();
 
-        // Parse PostgreSQL array string e.g., "{worker_1:9001, worker_2:9002}"
-        std::string array_str = row[1].as<std::string>();
-        if (array_str.size() > 2)
+        std::string json_str = row[1].is_null() ? "[]" : row[1].as<std::string>();
+        auto nodes_json = nlohmann::json::parse(json_str);
+
+        for (const auto &item : nodes_json)
         {
-          array_str = array_str.substr(1, array_str.size() - 2);
-
-          std::stringstream ss(array_str);
-          std::string node_str;
-
-          while (std::getline(ss, node_str, ','))
-          {
-            size_t colon_pos = node_str.find(':');
-            if (colon_pos != std::string::npos)
-            {
-              WorkerLocation loc;
-              loc.host = node_str.substr(0, colon_pos);
-              loc.port = std::stoi(node_str.substr(colon_pos + 1));
-              orphan.locations.push_back(loc);
-            }
-          }
+          WorkerLocation loc;
+          loc.host = item["host"].get<std::string>();
+          loc.port = item["port"].get<int>();
+          orphan.locations.push_back(loc);
         }
         orphans.push_back(orphan);
       }
-
       txn.commit();
     }
     catch (const std::exception &e)
@@ -319,5 +413,121 @@ public:
     {
       std::cerr << "[DB ERROR] RevertTombstone failed for " << hash << ": " << e.what() << "\n";
     }
+  }
+
+  // --- CLUSTER SCALING (ADMIN) ---
+  void AddCluster(const std::string &cluster_name, const std::vector<int> &active_node_ids) override
+  {
+    pqxx::connection conn(connection_string);
+    pqxx::work txn(conn);
+
+    // Validate referential integrity of target nodes within the transaction boundary
+    VerifyNodesExist(txn, active_node_ids);
+
+    std::string pg_array = "{";
+    for (size_t i = 0; i < active_node_ids.size(); ++i)
+    {
+      pg_array += std::to_string(active_node_ids[i]);
+      if (i < active_node_ids.size() - 1)
+        pg_array += ",";
+    }
+    pg_array += "}";
+
+    // 1. Insert the new cluster definition
+    pqxx::result insert_res = txn.exec_params(
+        "INSERT INTO clusters (cluster_name, active_nodes) VALUES ($1, $2) RETURNING cluster_id",
+        cluster_name, pg_array);
+    int new_cluster_id = insert_res[0][0].as<int>();
+
+    // 2. Query the current distribution footprint
+    pqxx::result current_clusters = txn.exec(
+        "SELECT cluster_id, COUNT(bucket_id) FROM shard_map GROUP BY cluster_id");
+    std::cout << "[DEBUG] current_clusters.size() = "
+              << current_clusters.size() << "\n";
+
+    std::cout << "[DEBUG] new_cluster_id = "
+              << new_cluster_id << "\n";
+
+    std::cout << "[DEBUG] num_buckets = "
+              << num_buckets << "\n";
+
+    if (current_clusters.empty())
+    {
+      // BOOTSTRAP STATE: This is the first cluster. Initialize the entire shard map.
+      // Uses generate_series to bulk-insert all logical partitions efficiently.
+      std::cout << "[DEBUG] BOOTSTRAPPING SHARD MAP\n";
+      pqxx::result result = txn.exec_params(
+          "INSERT INTO shard_map (bucket_id, cluster_id) "
+          "SELECT g.id, $1 FROM generate_series(0, $2) AS g(id) "
+          "ON CONFLICT (bucket_id) DO UPDATE SET cluster_id = EXCLUDED.cluster_id",
+          new_cluster_id, num_buckets - 1);
+      std::cout << "[DEBUG] Inserted "
+                << result.affected_rows()
+                << " shard_map rows\n";
+    }
+    else
+    {
+      // SCALE-OUT STATE: Existing clusters detected. Rebalance buckets evenly.
+      int total_clusters = current_clusters.size() + 1;
+      int target_buckets = num_buckets / total_clusters;
+
+      for (const auto &row : current_clusters)
+      {
+        int existing_cluster_id = row[0].as<int>();
+        int current_owned = row[1].as<int>();
+        int buckets_to_reassign = current_owned - target_buckets;
+
+        if (buckets_to_reassign > 0)
+        {
+          txn.exec_params(
+              "UPDATE shard_map SET cluster_id = $1 "
+              "WHERE bucket_id IN ( "
+              "    SELECT bucket_id FROM shard_map WHERE cluster_id = $2 LIMIT $3 "
+              ")",
+              new_cluster_id, existing_cluster_id, buckets_to_reassign);
+        }
+      }
+    }
+
+    txn.commit();
+  }
+
+  void ReplaceCluster(int cluster_id, const std::vector<int> &new_worker_ids) override
+  {
+    pqxx::connection conn(connection_string);
+    pqxx::work txn(conn);
+
+    // Verify targeted cluster exists before modifying associated workers
+    pqxx::result cluster_check = txn.exec_params(
+        "SELECT 1 FROM clusters WHERE cluster_id = $1", cluster_id);
+    if (cluster_check.empty())
+    {
+      throw std::runtime_error("Validation failed: Target cluster_id does not exist.");
+    }
+
+    // Verify the existence of replacing worker nodes
+    VerifyNodesExist(txn, new_worker_ids);
+
+    // Mark previous active worker nodes for this cluster as READ_ONLY
+    txn.exec_params(
+        "UPDATE worker_nodes SET status = 'READ_ONLY' "
+        "WHERE worker_id IN (SELECT unnest(active_nodes) FROM clusters WHERE cluster_id = $1)",
+        cluster_id);
+
+    std::string pg_array = "{";
+    for (size_t i = 0; i < new_worker_ids.size(); ++i)
+    {
+      pg_array += std::to_string(new_worker_ids[i]);
+      if (i < new_worker_ids.size() - 1)
+        pg_array += ",";
+    }
+    pg_array += "}";
+
+    // Update mapping definition in the clusters table
+    txn.exec_params(
+        "UPDATE clusters SET active_nodes = $1 WHERE cluster_id = $2",
+        pg_array, cluster_id);
+
+    txn.commit();
   }
 };
