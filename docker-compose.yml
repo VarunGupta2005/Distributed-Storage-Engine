@@ -1,7 +1,9 @@
-version: '3.8'
+# Note: 'version' is omitted as it is obsolete in modern Docker Compose V2.
 
 services:
-  # 1. Central PostgreSQL Database
+  # ---------------------------------------------------------
+  # CENTRAL STATE (METADATA LAYER)
+  # ---------------------------------------------------------
   postgres_db:
     image: postgres:15-alpine
     container_name: local_postgres
@@ -14,19 +16,140 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data 
       - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d metadata"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
-  # 2. NGINX Load Balancer
+  # ---------------------------------------------------------
+  # CONTROL PLANE (STATELESS MASTERS)
+  # ---------------------------------------------------------
+  master_1:
+    build: 
+      context: .
+      target: master_runtime
+    container_name: master_1
+    environment:
+      DATABASE_URL: "postgresql://postgres:password@postgres_db:5432/metadata"
+      NUM_BUCKETS: "256"
+      CLUSTER_SECRET: "internal_cluster_auth_key"
+      SESSION_SECRET: "client_session_auth_key"
+    depends_on:
+      postgres_db:
+        condition: service_healthy
+
+  master_2:
+    build: 
+      context: .
+      target: master_runtime
+    container_name: master_2
+    environment:
+      DATABASE_URL: "postgresql://postgres:password@postgres_db:5432/metadata"
+      NUM_BUCKETS: "256"
+      CLUSTER_SECRET: "internal_cluster_auth_key"
+      SESSION_SECRET: "client_session_auth_key"
+    depends_on:
+      postgres_db:
+        condition: service_healthy
+
+  # ---------------------------------------------------------
+  # CONTROL PLANE LOAD BALANCER
+  # ---------------------------------------------------------
   nginx_lb:
     image: nginx:alpine
-    container_name: local_nginx
+    container_name: master_lb
     ports:
       - "80:80" 
     volumes:
-      - ./nginx/master_nginx.conf:/etc/nginx/nginx.conf:ro # Mount config file as Read-Only
-    extra_hosts:
-      - "host.docker.internal:host-gateway" # Allow NGINX to talk to laptop's ip address
+      - ./nginx/master_nginx.conf:/etc/nginx/nginx.conf:ro
+    # Forces Docker to create Master DNS records before booting NGINX
     depends_on:
-      - postgres_db # Ensure database starts before the load balancer
+      - master_1
+      - master_2
+
+  # ---------------------------------------------------------
+  # DATA PLANE (STORAGE WORKERS)
+  # ---------------------------------------------------------
+  worker_1:
+    build: 
+      context: .
+      target: worker_runtime
+    container_name: worker_1
+    command: ["9001"]
+    ports:
+      - "9001:9001" 
+    environment:
+      MASTER_LB_HOST: "nginx_lb"
+      INTERNAL_HOST: "worker_1"
+      ADVERTISED_HOST: "127.0.0.1"
+      AES_KEY: "0123456789abcdef0123456789abcdef"
+      CLUSTER_SECRET: "internal_cluster_auth_key"
+    volumes:
+      - worker1_data:/app/data
+    depends_on:
+      - nginx_lb
+
+  worker_2:
+    build: 
+      context: .
+      target: worker_runtime
+    container_name: worker_2
+    command: ["9002"]
+    ports:
+      - "9002:9002"
+    environment:
+      MASTER_LB_HOST: "nginx_lb"
+      INTERNAL_HOST: "worker_2"
+      ADVERTISED_HOST: "127.0.0.1"
+      AES_KEY: "fedcba9876543210fedcba9876543210"
+      CLUSTER_SECRET: "internal_cluster_auth_key"
+    volumes:
+      - worker2_data:/app/data
+    depends_on:
+      - nginx_lb
+
+  worker_3:
+    build: 
+      context: .
+      target: worker_runtime
+    container_name: worker_3
+    command: ["9003"]
+    ports:
+      - "9003:9003"
+    environment:
+      MASTER_LB_HOST: "nginx_lb"
+      INTERNAL_HOST: "worker_3"
+      ADVERTISED_HOST: "127.0.0.1"
+      AES_KEY: "fedcba9876543210fedcba9876543210"
+      CLUSTER_SECRET: "internal_cluster_auth_key"
+    volumes:
+      - worker3_data:/app/data
+    depends_on:
+      - nginx_lb
+
+  worker_4:
+    build: 
+      context: .
+      target: worker_runtime
+    container_name: worker_4
+    command: ["9004"]
+    ports:
+      - "9004:9004"
+    environment:
+      MASTER_LB_HOST: "nginx_lb"
+      INTERNAL_HOST: "worker_4"
+      ADVERTISED_HOST: "127.0.0.1"
+      AES_KEY: "fedcba9876543210fedcba9876543210"
+      CLUSTER_SECRET: "internal_cluster_auth_key"
+    volumes:
+      - worker4_data:/app/data
+    depends_on:
+      - nginx_lb
 
 volumes:
   pgdata:
+  worker1_data:
+  worker2_data:
+  worker3_data:
+  worker4_data:

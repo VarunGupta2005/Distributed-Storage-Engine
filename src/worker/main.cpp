@@ -34,7 +34,7 @@ void SignalHandler(int signal)
 // Background daemon thread for telemetry.
 // Periodically transmits the worker's network identities and physical storage capacity to the Control Plane.
 void HeartbeatDaemon(const std::string &master_lb, const std::string &internal_host,
-                     const std::string &advertised_host, int port, const std::string &storage_dir)
+                     const std::string &advertised_host, int port, const std::string &storage_dir, const std::string &cluster_secret)
 {
   std::cout << "[HEARTBEAT] Daemon started. Targeting Control Plane at " << master_lb << ":80\n";
 
@@ -63,7 +63,7 @@ void HeartbeatDaemon(const std::string &master_lb, const std::string &internal_h
 
       // Include the cluster secret for mutual authentication.
       httplib::Headers headers = {
-          {"X-Cluster-Secret", "my_shared_secret_key"}};
+          {"X-Cluster-Secret", cluster_secret}};
 
       auto res = cli.Post("/heartbeat", headers, payload.dump(), "application/json");
 
@@ -109,6 +109,9 @@ int main(int argc, char *argv[])
   const char *env_advertised = std::getenv("ADVERTISED_HOST");
   std::string advertised_host = env_advertised ? env_advertised : "127.0.0.1";
 
+  const char *env_cluster_secret = std::getenv("CLUSTER_SECRET");
+  std::string cluster_secret = env_cluster_secret ? env_cluster_secret : "";
+
   std::string storage_dir = "./data/node_" + std::to_string(port);
 
   const char *key = std::getenv("AES_KEY");
@@ -128,7 +131,7 @@ int main(int argc, char *argv[])
   LocalDiskStorage storage(storage_dir, node_key);
 
   // Start the background heartbeat telemetry thread.
-  std::thread hb_thread(HeartbeatDaemon, master_lb, internal_host, advertised_host, port, storage_dir);
+  std::thread hb_thread(HeartbeatDaemon, master_lb, internal_host, advertised_host, port, storage_dir, cluster_secret);
 
   // Run the HTTP server in a separate thread to allow the main thread to monitor signals.
   WorkerServer server(&storage);
