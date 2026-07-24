@@ -48,3 +48,29 @@ target_link_libraries(worker_server
     Threads::Threads
     OpenSSL::Crypto
 )
+
+# ---------------------------------------------------------
+# EXECUTABLE 3: Native CLI Client
+# ---------------------------------------------------------
+add_executable(client_cli
+    src/client/main.cpp
+    src/client/cli/CLI.cpp
+    src/client/DSEClient.cpp
+    src/client/crypto/OpenSSLCryptoEngine.cpp
+    src/client/file/LocalFileSlicer.cpp
+    src/client/state/LocalStateManager.cpp
+    src/client/network/MasterHttpClient.cpp
+    src/client/network/ParallelTransferManager.cpp
+)
+
+# Enforce target-specific include directories
+target_include_directories(client_cli PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+)
+
+# Link the client to multithreading and OpenSSL
+target_link_libraries(client_cli
+    PRIVATE
+    Threads::Threads
+    OpenSSL::Crypto
+)

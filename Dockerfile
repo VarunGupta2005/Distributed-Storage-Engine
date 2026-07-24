@@ -18,7 +18,7 @@ COPY src/ ./src/
 
 RUN mkdir build && cd build && \
     cmake .. && \
-    make -j$(nproc)
+    cmake --build . --target master_server worker_server --parallel $(nproc)
 
 # ---------------------------------------------------------
 # STAGE 2: Master Node Runtime

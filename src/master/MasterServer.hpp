@@ -14,11 +14,37 @@ private:
     httplib::Server svr;
     IMetadataRepository *db;
 
-    // Configuration values loaded dynamically from environment variables
     std::string cluster_secret;
     std::string session_secret;
 
-    // Registers lambda bindings that delegate requests to dedicated handler functions
+    // Helper utility to parse the Bearer Token and authorize the transaction thread-safely.
+    bool AuthenticateUser(const httplib::Request &req, httplib::Response &res, int &user_id)
+    {
+        if (!req.has_header("Authorization"))
+        {
+            res.status = 401;
+            res.set_content(R"({"error": "Unauthorized: Missing token"})", "application/json");
+            return false;
+        }
+        std::string auth_header = req.get_header_value("Authorization");
+        if (auth_header.rfind("Bearer ", 0) != 0)
+        {
+            res.status = 401;
+            res.set_content(R"({"error": "Unauthorized: Malformed token"})", "application/json");
+            return false;
+        }
+        std::string token = auth_header.substr(7);
+
+        // Invokes cryptographic verification helper in crypto.hpp [14]
+        if (!VerifySessionToken(token, session_secret, user_id))
+        {
+            res.status = 401;
+            res.set_content(R"({"error": "Unauthorized: Invalid or expired token"})", "application/json");
+            return false;
+        }
+        return true;
+    }
+
     void RegisterRoutes(int node_port)
     {
         svr.Get("/", [this, node_port](const httplib::Request &req, httplib::Response &res)
@@ -36,6 +62,10 @@ private:
         svr.Post("/files/commit", [this](const httplib::Request &req, httplib::Response &res)
                  { HandleCommit(req, res); });
 
+        // NEW: Endpoint providing data plane routing blueprints to authorized download clients.
+        svr.Get("/files/download-plan", [this](const httplib::Request &req, httplib::Response &res)
+                { HandleDownloadPlan(req, res); });
+
         svr.Post("/heartbeat", [this](const httplib::Request &req, httplib::Response &res)
                  { HandleHeartbeat(req, res); });
 
@@ -44,10 +74,61 @@ private:
 
         svr.Post("/admin/cluster/replace", [this](const httplib::Request &req, httplib::Response &res)
                  { HandleReplaceCluster(req, res); });
+
+        svr.Get("/files/exists", [this](const httplib::Request &req, httplib::Response &res)
+                { HandleFileExists(req, res); });
+
+        svr.Delete("/files", [this](const httplib::Request &req, httplib::Response &res)
+                   { HandleDeleteFile(req, res); });
     }
 
     // --- ENDPOINT HANDLERS ---
+    // Inside ENDPOINT HANDLERS:
+    void HandleFileExists(const httplib::Request &req, httplib::Response &res)
+    {
+        int user_id = 0;
+        if (!AuthenticateUser(req, res, user_id))
+            return;
 
+        if (!req.has_param("filename"))
+        {
+            res.status = 400;
+            return;
+        }
+
+        std::string filename = req.get_param_value("filename");
+        bool exists = this->db->FileExists(user_id, filename);
+
+        nlohmann::json response = {{"exists", exists}};
+        res.status = 200;
+        res.set_content(response.dump(), "application/json");
+    }
+
+    void HandleDeleteFile(const httplib::Request &req, httplib::Response &res)
+    {
+        int user_id = 0;
+        if (!AuthenticateUser(req, res, user_id))
+            return;
+
+        if (!req.has_param("filename"))
+        {
+            res.status = 400;
+            return;
+        }
+
+        std::string filename = req.get_param_value("filename");
+
+        if (this->db->DeleteFile(user_id, filename))
+        {
+            res.status = 200;
+            res.set_content(R"({"status": "success", "message": "File deleted."})", "application/json");
+        }
+        else
+        {
+            res.status = 404;
+            res.set_content(R"({"error": "File not found"})", "application/json");
+        }
+    }
     void HandleHealthCheck(const httplib::Request &req, httplib::Response &res, int node_port)
     {
         try
@@ -140,12 +221,16 @@ private:
 
     void HandleUploadInit(const httplib::Request &req, httplib::Response &res)
     {
+        int user_id = 0;
+        if (!AuthenticateUser(req, res, user_id))
+            return; // Validates JWT session token
+
         try
         {
             auto json = nlohmann::json::parse(req.body);
             std::vector<std::string> client_hashes = json.at("hashes").get<std::vector<std::string>>();
 
-            std::vector<MissingChunkPlan> missing = this->db->FilterMissingChunks(client_hashes);
+            std::vector<ChunkRoutingPlan> missing = this->db->FilterMissingChunks(client_hashes);
 
             nlohmann::json missing_json = nlohmann::json::array();
             for (const auto &plan : missing)
@@ -188,6 +273,10 @@ private:
 
     void HandleCommit(const httplib::Request &req, httplib::Response &res)
     {
+        int user_id = 0;
+        if (!AuthenticateUser(req, res, user_id))
+            return; // Extract verified user_id
+
         try
         {
             auto json = nlohmann::json::parse(req.body);
@@ -195,7 +284,8 @@ private:
             long long file_size = json.at("file_size").get<long long>();
             std::vector<std::string> chunk_hashes = json.at("chunk_hashes").get<std::vector<std::string>>();
 
-            this->db->CommitFile(filename, file_size, chunk_hashes);
+            // Commits file bound strictly to the calling user_id to enforce multi-tenancy
+            this->db->CommitFile(user_id, filename, file_size, chunk_hashes);
 
             res.status = 200;
             res.set_content(R"({"status": "success"})", "application/json");
@@ -207,6 +297,67 @@ private:
         catch (const std::exception &e)
         {
             res.status = 500;
+        }
+    }
+
+    void HandleDownloadPlan(const httplib::Request &req, httplib::Response &res)
+    {
+        int user_id = 0;
+        if (!AuthenticateUser(req, res, user_id))
+            return;
+        std::cout << "[DEBUG] Download authenticated as user_id="
+                  << user_id << "\n";
+        if (!req.has_param("filename"))
+        {
+            res.status = 400;
+            res.set_content(R"({"error": "Missing filename parameter"})", "application/json");
+            return;
+        }
+        std::string filename = req.get_param_value("filename");
+        std::cout << "[DEBUG] Download requested filename=["
+                  << filename << "]\n";
+        try
+        {
+            FileDownloadManifest manifest = this->db->GetDownloadPlan(user_id, filename);
+
+            nlohmann::json chunks_json = nlohmann::json::array();
+            for (const auto &plan : manifest.plans)
+            {
+                nlohmann::json nodes_json = nlohmann::json::array();
+                for (const auto &node : plan.assigned_nodes)
+                {
+                    nodes_json.push_back({{"advertised_host", node.advertised_host},
+                                          {"advertised_port", node.advertised_port}});
+                }
+                chunks_json.push_back({{"hash", plan.hash},
+                                       {"assigned_nodes", nodes_json}});
+            }
+
+            nlohmann::json response = {
+                {"status", "success"},
+                {"file_size", manifest.file_size},
+                {"chunks", chunks_json}};
+
+            res.status = 200;
+            res.set_content(response.dump(), "application/json");
+        }
+        catch (const std::runtime_error &e)
+        {
+            std::cerr << "[DOWNLOAD ERROR] " << e.what() << "\n";
+
+            res.status = 404;
+            res.set_content(
+                R"({"error": "File not found or access denied"})",
+                "application/json");
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "[DOWNLOAD INTERNAL ERROR] " << e.what() << "\n";
+
+            res.status = 500;
+            res.set_content(
+                R"({"error": "Internal server error"})",
+                "application/json");
         }
     }
 
@@ -287,7 +438,6 @@ private:
     }
 
 public:
-    // Constructor handles initialization, configuration loading, and route registration delegation
     MasterServer(int node_port, IMetadataRepository *repo, const std::string &cluster_secret, const std::string &session_secret) : db(repo), cluster_secret(cluster_secret), session_secret(session_secret)
     {
         RegisterRoutes(node_port);

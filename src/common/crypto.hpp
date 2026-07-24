@@ -237,3 +237,53 @@ inline bool ConstantTimeEquals(const std::string &a, const std::string &b)
   }
   return CRYPTO_memcmp(a.data(), b.data(), a.size()) == 0;
 }
+
+// Verifies the signature and expiration of a session token [14]
+inline bool VerifySessionToken(const std::string &token, const std::string &session_secret, int &user_id)
+{
+  std::stringstream ss(token);
+  std::string segment;
+  std::vector<std::string> segments;
+  while (std::getline(ss, segment, '.'))
+  {
+    segments.push_back(segment);
+  }
+
+  if (segments.size() != 3)
+  {
+    return false;
+  }
+
+  std::string user_id_str = segments[0];
+  std::string expiry_str = segments[1];
+  std::string signature = segments[2];
+
+  std::string payload = user_id_str + "." + expiry_str;
+  std::string expected_signature = hmac_sha256(session_secret, payload);
+
+  // Timing-attack safe signature validation [14]
+  if (!ConstantTimeEquals(signature, expected_signature))
+  {
+    return false;
+  }
+
+  try
+  {
+    long long expiry = std::stoll(expiry_str);
+    long long current_time = std::chrono::duration_cast<std::chrono::seconds>(
+                                 std::chrono::system_clock::now().time_since_epoch())
+                                 .count();
+
+    if (current_time > expiry)
+    {
+      return false; // Token has expired [14]
+    }
+
+    user_id = std::stoi(user_id_str);
+    return true;
+  }
+  catch (...)
+  {
+    return false;
+  }
+}

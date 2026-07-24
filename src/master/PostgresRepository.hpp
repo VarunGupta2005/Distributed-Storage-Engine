@@ -12,12 +12,12 @@ class PostgresRepository : public IMetadataRepository
 private:
   std::string connection_string;
 
-  const int num_buckets; // Decoupled partition dimension
+  const int num_buckets;
 
-  // Helper for translating JSON node data directly into structures
-  MissingChunkPlan ParseNodePlanFromJson(const std::string &hash, const std::string &json_nodes_data)
+  // Resolves worker_ids to JSON objects containing network coordinates
+  ChunkRoutingPlan ParseNodePlanFromJson(const std::string &hash, const std::string &json_nodes_data)
   {
-    MissingChunkPlan plan;
+    ChunkRoutingPlan plan;
     plan.hash = hash;
 
     if (json_nodes_data.empty() || json_nodes_data == "null")
@@ -27,7 +27,6 @@ private:
     for (const auto &item : nodes_json)
     {
       NodeInfo info;
-      info.internal_coord = item["internal_coord"].get<std::string>();
       info.advertised_host = item["advertised_host"].get<std::string>();
       info.advertised_port = item["advertised_port"].get<int>();
       plan.assigned_nodes.push_back(info);
@@ -35,7 +34,6 @@ private:
     return plan;
   }
 
-  // Computes the logical partition (bucket) for a given SHA-256 hash.
   inline int CalculateBucketId(const std::string &sha256_hex, int num_buckets)
   {
     if (sha256_hex.length() < 8)
@@ -48,12 +46,10 @@ private:
     }
     catch (...)
     {
-      return 0; // Fallback for invalid hash format
+      return 0;
     }
   }
 
-  // Transactionally validates that all provided worker IDs exist in the database.
-  // Throws standard runtime errors on empty lists or missing keys to force transaction rollback.
   void VerifyNodesExist(pqxx::work &txn, const std::vector<int> &node_ids)
   {
     if (node_ids.empty())
@@ -61,7 +57,6 @@ private:
       throw std::runtime_error("Validation failed: Worker ID list cannot be empty.");
     }
 
-    // Deduplicate elements to ensure exact comparison count against sql return value
     std::unordered_set<int> unique_ids(node_ids.begin(), node_ids.end());
 
     std::string pg_array = "{";
@@ -76,7 +71,6 @@ private:
     }
     pg_array += "}";
 
-    // Verify existences of the parsed IDs
     pqxx::result count_res = txn.exec_params(
         "SELECT COUNT(*) FROM worker_nodes WHERE worker_id = ANY($1::integer[])",
         pg_array);
@@ -93,7 +87,6 @@ public:
   {
   }
 
-  // --- CONNECTIVITY TEST ---
   std::string GetDatabaseVersion() override
   {
     pqxx::connection conn(connection_string);
@@ -103,10 +96,6 @@ public:
     return res[0][0].as<std::string>();
   }
 
-  // --- AUTHENTICATION ---
-
-  // Inserts a new user record. Uses parameterized queries to prevent SQL injection.
-  // Returns false if a unique constraint violation occurs (e.g., email already exists).
   bool CreateUser(const std::string &email, const std::string &password_hash, const std::string &salt) override
   {
     try
@@ -128,7 +117,6 @@ public:
     }
   }
 
-  // Retrieves user credentials based on email for session token generation.
   UserRecord GetUserByEmail(const std::string &email) override
   {
     UserRecord record;
@@ -152,15 +140,11 @@ public:
     catch (const std::exception &e)
     {
       std::cerr << "[DB ERROR] GetUserByEmail failed: " << e.what() << "\n";
-      throw; // Propagate exception to prevent swallowing infrastructure failures
+      throw;
     }
     return record;
   }
 
-  // --- WORKER NODE DISCOVERY ---
-
-  // Executes an atomic UPSERT to register or update a Worker Node.
-  // Refreshes the last_heartbeat timestamp and updates capacity metrics.
   void RegisterWorker(const std::string &internal_host, int internal_port,
                       const std::string &advertised_host, int advertised_port,
                       long long free_space) override
@@ -194,16 +178,14 @@ public:
     }
   }
 
-  // --- DEDUPLICATION CHECK & SHARD ROUTING ---
-  std::vector<MissingChunkPlan> FilterMissingChunks(const std::vector<std::string> &client_hashes) override
+  std::vector<ChunkRoutingPlan> FilterMissingChunks(const std::vector<std::string> &client_hashes) override
   {
-    std::vector<MissingChunkPlan> missing_plans;
+    std::vector<ChunkRoutingPlan> missing_plans;
     pqxx::connection conn(connection_string);
     pqxx::work txn(conn);
 
     for (const auto &hash : client_hashes)
     {
-      // Subquery resolves worker_ids to JSON objects containing network coordinates
       pqxx::result res = txn.exec_params(
           "SELECT ref_count, nodes, "
           "(SELECT json_agg(json_build_object("
@@ -218,7 +200,6 @@ public:
       {
         int bucket_id = CalculateBucketId(hash, num_buckets);
 
-        // Fetch routing map and resolve worker coordinates in a single query
         pqxx::result routing_res = txn.exec_params(
             "SELECT c.active_nodes, "
             "(SELECT json_agg(json_build_object("
@@ -269,13 +250,12 @@ public:
     txn.commit();
     return missing_plans;
   }
-  // --- TWO-PHASE COMMIT ---
-  void CommitFile(const std::string &filename, long long file_size, const std::vector<std::string> &chunk_hashes) override
+
+  void CommitFile(int user_id, const std::string &filename, long long file_size, const std::vector<std::string> &chunk_hashes) override
   {
     pqxx::connection conn(connection_string);
     pqxx::work txn(conn);
 
-    // 1. Convert C++ vector to PostgreSQL native array format: e.g., {hash1,hash2}
     std::string pg_array = "{";
     for (size_t i = 0; i < chunk_hashes.size(); ++i)
     {
@@ -285,16 +265,14 @@ public:
     }
     pg_array += "}";
 
-    // 2. Insert the finalized file record (Hardcoding user_id = 1 for MVP)
+    // Inserts the finalized file record using the actual validated user_id
     txn.exec_params(
-        "INSERT INTO files (user_id, filename, size, chunks) VALUES (1, $1, $2, $3)",
+        "INSERT INTO files (user_id, filename, size, chunks) VALUES ($1, $2, $3, $4)",
+        user_id,
         filename,
         file_size,
         pg_array);
 
-    // 3. Batch update: transition all chunks in this file from pending (0) to active (1+)
-    // Also updates the 'created_at' timestamp to ensure that if this chunk ever drops back
-    // to a reference count of 0, the 24-hour deletion grace period starts from that deletion time.
     for (const auto &hash : chunk_hashes)
     {
       txn.exec_params(
@@ -305,7 +283,50 @@ public:
     txn.commit();
   }
 
-  // --- COOPERATIVE ORPHANED CHUNKS MANAGEMENT ---
+  FileDownloadManifest GetDownloadPlan(int user_id, const std::string &filename) override
+  {
+    pqxx::connection conn(connection_string);
+    pqxx::work txn(conn);
+
+    // 1. Fetch file size to confirm existence and multi-tenant authorization
+    pqxx::result file_res = txn.exec_params(
+        "SELECT size FROM files WHERE filename = $1 AND user_id = $2;",
+        filename, user_id);
+
+    if (file_res.empty())
+    {
+      throw std::runtime_error("File not found or access denied.");
+    }
+
+    FileDownloadManifest manifest;
+    manifest.file_size = file_res[0][0].as<long long>();
+
+    // 2. Resolve all chunk routing plans in a single ordered query
+    pqxx::result chunk_res = txn.exec_params(
+        "SELECT u.chunk_hash, "
+        "(SELECT json_agg(json_build_object("
+        "   'internal_coord', w.internal_host || ':' || w.internal_port, "
+        "   'advertised_host', w.advertised_host, "
+        "   'advertised_port', w.advertised_port"
+        ")) FROM worker_nodes w WHERE w.worker_id = ANY(c.nodes)) AS node_data "
+        "FROM files f "
+        "CROSS JOIN unnest(f.chunks) WITH ORDINALITY AS u(chunk_hash, ord) "
+        "JOIN chunks c ON c.chunk_hash = u.chunk_hash "
+        "WHERE f.filename = $1 AND f.user_id = $2 "
+        "ORDER BY u.ord",
+        filename, user_id);
+
+    for (const auto &row : chunk_res)
+    {
+      std::string hash = row[0].as<std::string>();
+      std::string json_nodes_data = row[1].is_null() ? "[]" : row[1].as<std::string>();
+      manifest.plans.push_back(ParseNodePlanFromJson(hash, json_nodes_data));
+    }
+
+    txn.commit();
+    return manifest;
+  }
+
   std::vector<OrphanedChunk> GetOrphanedChunks(int expiry_hours, int limit) override
   {
     std::vector<OrphanedChunk> orphans;
@@ -314,7 +335,6 @@ public:
       pqxx::connection conn(connection_string);
       pqxx::work txn(conn);
 
-      // Uses a Common Table Expression (CTE) to lock rows and resolve node JSON concurrently
       std::string query =
           "WITH updated AS ("
           "  UPDATE chunks SET ref_count = -1 "
@@ -357,7 +377,6 @@ public:
     return orphans;
   }
 
-  // --- SAFETY GATED DELETION ---
   bool DeleteChunkRecordsBulk(const std::vector<std::string> &hashes) override
   {
     if (hashes.empty())
@@ -390,7 +409,6 @@ public:
     return false;
   }
 
-  // --- FAILOVER RECOVERY ---
   void RevertTombstone(const std::string &hash) override
   {
     try
@@ -398,9 +416,6 @@ public:
       pqxx::connection conn(connection_string);
       pqxx::work txn(conn);
 
-      // Reverts -1 to 0 and resets the 'created_at' lease timestamp.
-      // This grants the failed/offline Worker Node a fresh 24-hour lease window to recover,
-      // preventing the Garbage Collector from immediately re-sweeping it on the next loop.
       txn.exec_params(
           "UPDATE chunks SET ref_count = 0, created_at = CURRENT_TIMESTAMP "
           "WHERE chunk_hash = $1 AND ref_count = -1;",
@@ -415,13 +430,11 @@ public:
     }
   }
 
-  // --- CLUSTER SCALING (ADMIN) ---
   void AddCluster(const std::string &cluster_name, const std::vector<int> &active_node_ids) override
   {
     pqxx::connection conn(connection_string);
     pqxx::work txn(conn);
 
-    // Validate referential integrity of target nodes within the transaction boundary
     VerifyNodesExist(txn, active_node_ids);
 
     std::string pg_array = "{";
@@ -433,13 +446,11 @@ public:
     }
     pg_array += "}";
 
-    // 1. Insert the new cluster definition
     pqxx::result insert_res = txn.exec_params(
         "INSERT INTO clusters (cluster_name, active_nodes) VALUES ($1, $2) RETURNING cluster_id",
         cluster_name, pg_array);
     int new_cluster_id = insert_res[0][0].as<int>();
 
-    // 2. Query the current distribution footprint
     pqxx::result current_clusters = txn.exec(
         "SELECT cluster_id, COUNT(bucket_id) FROM shard_map GROUP BY cluster_id");
     std::cout << "[DEBUG] current_clusters.size() = "
@@ -453,8 +464,6 @@ public:
 
     if (current_clusters.empty())
     {
-      // BOOTSTRAP STATE: This is the first cluster. Initialize the entire shard map.
-      // Uses generate_series to bulk-insert all logical partitions efficiently.
       std::cout << "[DEBUG] BOOTSTRAPPING SHARD MAP\n";
       pqxx::result result = txn.exec_params(
           "INSERT INTO shard_map (bucket_id, cluster_id) "
@@ -467,7 +476,6 @@ public:
     }
     else
     {
-      // SCALE-OUT STATE: Existing clusters detected. Rebalance buckets evenly.
       int total_clusters = current_clusters.size() + 1;
       int target_buckets = num_buckets / total_clusters;
 
@@ -497,7 +505,6 @@ public:
     pqxx::connection conn(connection_string);
     pqxx::work txn(conn);
 
-    // Verify targeted cluster exists before modifying associated workers
     pqxx::result cluster_check = txn.exec_params(
         "SELECT 1 FROM clusters WHERE cluster_id = $1", cluster_id);
     if (cluster_check.empty())
@@ -505,10 +512,8 @@ public:
       throw std::runtime_error("Validation failed: Target cluster_id does not exist.");
     }
 
-    // Verify the existence of replacing worker nodes
     VerifyNodesExist(txn, new_worker_ids);
 
-    // Mark previous active worker nodes for this cluster as READ_ONLY
     txn.exec_params(
         "UPDATE worker_nodes SET status = 'READ_ONLY' "
         "WHERE worker_id IN (SELECT unnest(active_nodes) FROM clusters WHERE cluster_id = $1)",
@@ -523,11 +528,51 @@ public:
     }
     pg_array += "}";
 
-    // Update mapping definition in the clusters table
     txn.exec_params(
         "UPDATE clusters SET active_nodes = $1 WHERE cluster_id = $2",
         pg_array, cluster_id);
 
     txn.commit();
+  }
+  bool FileExists(int user_id, const std::string &filename) override
+  {
+    pqxx::connection conn(connection_string);
+    pqxx::work txn(conn);
+    pqxx::result res = txn.exec_params(
+        "SELECT 1 FROM files WHERE user_id = $1 AND filename = $2;",
+        user_id, filename);
+    txn.commit();
+    return !res.empty();
+  }
+
+  bool DeleteFile(int user_id, const std::string &filename) override
+  {
+    pqxx::connection conn(connection_string);
+    pqxx::work txn(conn);
+
+    // 1. Fetch the array of chunk hashes for the target file
+    pqxx::result res = txn.exec_params(
+        "SELECT chunks FROM files WHERE user_id = $1 AND filename = $2;",
+        user_id, filename);
+
+    if (res.empty())
+    {
+      return false; // File does not exist
+    }
+
+    std::string pg_array = res[0][0].as<std::string>();
+
+    // 2. Decrement ref_count for all chunks using native array expansion
+    txn.exec_params(
+        "UPDATE chunks SET ref_count = ref_count - 1 WHERE chunk_hash = ANY($1::text[]);",
+        pg_array);
+
+    // 3. Delete the file record from the database
+    txn.exec_params(
+        "DELETE FROM files WHERE user_id = $1 AND filename = $2;",
+        user_id, filename);
+
+    txn.commit();
+    return true;
   }
 };
